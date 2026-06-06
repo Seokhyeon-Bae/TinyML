@@ -19,6 +19,8 @@ data:
   binary: true
   use_smote: true
   balance_ratio: 4.0
+  partition_strategy: label_balanced  # label_balanced | dirichlet | attack_class
+  dirichlet_alpha: 0.3
 
 model:
   # mlp or cnn (usually mlp for IDS)

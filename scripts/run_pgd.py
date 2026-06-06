@@ -249,6 +249,12 @@ def main():
     parser.add_argument("--config", default="config/federated.yaml", help="Federated/config for data + adversarial_training.attack")
     parser.add_argument("--fgsm-config", default="config/fgsm.yaml", help="Attack params (epsilon, threshold); also used for PGD epsilon range")
     parser.add_argument("--output-dir", required=True, help="Write pgd_report.md and pgd_results.json here")
+    parser.add_argument(
+        "--attack",
+        default=None,
+        choices=["fgsm", "pgd"],
+        help="Override adversarial_training.attack from config",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -259,7 +265,7 @@ def main():
     with open(args.config, encoding="utf-8") as f:
         fed_cfg = yaml.safe_load(f)
     at_cfg = fed_cfg.get("adversarial_training", {})
-    attack_type = (at_cfg.get("attack") or "fgsm").strip().lower()
+    attack_type = (args.attack or at_cfg.get("attack") or "fgsm").strip().lower()
     pgd_steps = int(at_cfg.get("pgd_steps", 10))
     pgd_alpha = at_cfg.get("pgd_alpha")
     at_epsilon = at_cfg.get("epsilon")

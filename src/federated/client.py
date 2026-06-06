@@ -44,7 +44,7 @@ import numpy as np
 import yaml
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
-from src.data.loader import load_dataset, partition_non_iid
+from src.data.loader import load_dataset, partition_data
 from src.models import nets
 from src.modelcompression.quantization import (
     QuantizationParams,
@@ -517,9 +517,21 @@ def simulate_clients(config: dict = None):
     }
 
     num_clients = int(data_cfg.get("num_clients", 1))
+    partition_strategy = data_cfg.get("partition_strategy", "label_balanced")
+    dirichlet_alpha = float(data_cfg.get("dirichlet_alpha", 0.3))
+    return_attack_labels = partition_strategy in {"attack_class", "attack_shift"}
 
     try:
-        x_train, y_train, x_test, y_test = load_dataset(dataset_name, **dataset_kwargs)
+        if return_attack_labels and dataset_name.lower() in {
+            "cicids2017", "cic-ids-2017", "cic_ids_2017"
+        }:
+            dataset_kwargs["return_attack_labels"] = True
+            x_train, y_train, x_test, y_test, attack_train, attack_test = load_dataset(
+                dataset_name, **dataset_kwargs
+            )
+        else:
+            x_train, y_train, x_test, y_test = load_dataset(dataset_name, **dataset_kwargs)
+            attack_train = attack_test = None
     except FileNotFoundError as err:
         data_path = dataset_kwargs.get("data_path") or dataset_kwargs.get("path")
         hint = f" (checked path: {data_path})" if data_path else ""
@@ -543,8 +555,22 @@ def simulate_clients(config: dict = None):
         input_shape = x_train.shape[1:]
 
     # Partition data
-    train_parts = partition_non_iid(x_train, y_train, num_clients)
-    test_parts = partition_non_iid(x_test, y_test, num_clients)
+    train_parts = partition_data(
+        x_train,
+        y_train,
+        num_clients,
+        strategy=partition_strategy,
+        dirichlet_alpha=dirichlet_alpha,
+        attack_labels=attack_train,
+    )
+    test_parts = partition_data(
+        x_test,
+        y_test,
+        num_clients,
+        strategy=partition_strategy,
+        dirichlet_alpha=dirichlet_alpha,
+        attack_labels=attack_test,
+    )
 
     # Print client data distribution for debugging class imbalance
     print("\n" + "="*60)

@@ -14,13 +14,14 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 
-def convert_to_c_array(model_path: str, output_path: str):
+def convert_to_c_array(model_path: str, output_path: str, array_name: str = None):
     """
     Convert TFLite model to C array
 
     Args:
         model_path: Path to TFLite model file
         output_path: Path to output C file
+        array_name: Optional C array symbol (default: derived from filename)
     """
     if not os.path.exists(model_path):
         print(f"❌ Model file not found: {model_path}")
@@ -31,7 +32,8 @@ def convert_to_c_array(model_path: str, output_path: str):
             model_data = f.read()
         
         # C array name from filename
-        array_name = Path(model_path).stem.replace('-', '_').replace('.', '_')
+        if array_name is None:
+            array_name = Path(model_path).stem.replace('-', '_').replace('.', '_')
         
         # Create C header file
         header_path = output_path.replace('.c', '.h')
@@ -147,7 +149,22 @@ if __name__ == "__main__":
         help='Only check model info, do not convert'
     )
     
+    parser.add_argument(
+        '--array-name',
+        type=str,
+        default='ids_tflite_model',
+        help='C array symbol name (default: ids_tflite_model for ESP32 IDS project)',
+    )
+    parser.add_argument(
+        '--esp32',
+        action='store_true',
+        help='Write directly to esp32_tflite_project/src/model_data.c (+ .h)',
+    )
+    
     args = parser.parse_args()
+
+    if args.esp32:
+        args.output = str(project_root / "esp32_tflite_project" / "src" / "model_data.c")
     
     # Check model info
     info = check_tflite_model(args.model)
@@ -157,13 +174,16 @@ if __name__ == "__main__":
     
     # Convert to C array
     if not args.check_only:
-        success = convert_to_c_array(args.model, args.output)
+        success = convert_to_c_array(args.model, args.output, array_name=args.array_name)
         if success:
             print("\n✅ Conversion complete!")
-            print(f"\n📋 Next steps:")
-            print(f"   1. Copy {args.output} to your ESP32 project")
-            print(f"   2. Copy {args.output.replace('.c', '.h')} to your ESP32 project")
-            print(f"   3. Include the header in your main.cpp")
+            if args.esp32:
+                print("   ESP32 project updated. Build with PlatformIO in esp32_tflite_project/")
+            else:
+                print(f"\n📋 Next steps:")
+                print(f"   1. Copy {args.output} to your ESP32 project")
+                print(f"   2. Copy {args.output.replace('.c', '.h')} to your ESP32 project")
+                print(f"   3. Include the header in your main.cpp")
         else:
             sys.exit(1)
 

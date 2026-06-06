@@ -23,6 +23,104 @@ def _ensure_dir(path: str) -> Path:
     return p
 
 
+def partition_dirichlet(
+    x: np.ndarray,
+    y: np.ndarray,
+    num_clients: int,
+    alpha: float = 0.3,
+    seed: int = 42,
+) -> List[Dict[str, np.ndarray]]:
+    """Dirichlet non-IID partition (standard in FL-IDS literature)."""
+    rng = np.random.default_rng(seed)
+    labels = np.unique(y.astype(int))
+    client_indices: List[List[int]] = [[] for _ in range(num_clients)]
+
+    for label in labels:
+        idx_k = np.where(y == label)[0]
+        rng.shuffle(idx_k)
+        if len(idx_k) == 0:
+            continue
+        proportions = rng.dirichlet(np.repeat(alpha, num_clients))
+        split_points = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
+        splits = np.split(idx_k, split_points)
+        for cid, split in enumerate(splits):
+            if split.size > 0:
+                client_indices[cid].extend(split.tolist())
+
+    parts = []
+    for cid in range(num_clients):
+        idx = client_indices[cid]
+        if not idx:
+            ridx = rng.choice(len(x), size=max(1, len(x) // num_clients), replace=False)
+            parts.append({"x": x[ridx], "y": y[ridx]})
+        else:
+            idx_arr = np.array(idx, dtype=int)
+            parts.append({"x": x[idx_arr], "y": y[idx_arr]})
+    return parts
+
+
+def partition_by_attack_class(
+    x: np.ndarray,
+    y: np.ndarray,
+    attack_labels: np.ndarray,
+    num_clients: int,
+    seed: int = 42,
+) -> List[Dict[str, np.ndarray]]:
+    """Assign attack sub-types to clients; BENIGN spread across all clients."""
+    rng = np.random.default_rng(seed)
+    attack_labels = np.asarray(attack_labels)
+    if len(attack_labels) != len(y):
+        raise ValueError("attack_labels length must match y")
+
+    client_indices: List[List[int]] = [[] for _ in range(num_clients)]
+    benign_idx = np.where(y == 0)[0]
+    rng.shuffle(benign_idx)
+    benign_splits = np.array_split(benign_idx, num_clients)
+    for cid, split in enumerate(benign_splits):
+        client_indices[cid].extend(split.tolist())
+
+    attack_idx = np.where(y == 1)[0]
+    attack_types = np.unique(attack_labels[attack_idx])
+    for i, atk in enumerate(sorted(attack_types, key=str)):
+        idxs = attack_idx[attack_labels[attack_idx] == atk]
+        rng.shuffle(idxs)
+        target_client = i % num_clients
+        client_indices[target_client].extend(idxs.tolist())
+
+    parts = []
+    for cid in range(num_clients):
+        idx = np.array(client_indices[cid], dtype=int)
+        rng.shuffle(idx)
+        parts.append({"x": x[idx], "y": y[idx]})
+    return parts
+
+
+def partition_data(
+    x: np.ndarray,
+    y: np.ndarray,
+    num_clients: int,
+    strategy: str = "label_balanced",
+    dirichlet_alpha: float = 0.3,
+    attack_labels: np.ndarray = None,
+    seed: int = 42,
+) -> List[Dict[str, np.ndarray]]:
+    """Dispatch partition strategy from config."""
+    strategy = (strategy or "label_balanced").lower()
+    if strategy in {"label_balanced", "iid", "quasi_iid"}:
+        return partition_non_iid(x, y, num_clients)
+    if strategy in {"dirichlet", "non_iid"}:
+        return partition_dirichlet(
+            x, y, num_clients, alpha=dirichlet_alpha, seed=seed
+        )
+    if strategy in {"attack_class", "attack_shift"}:
+        if attack_labels is None:
+            raise ValueError("attack_labels required for attack_class partition")
+        return partition_by_attack_class(
+            x, y, attack_labels, num_clients, seed=seed
+        )
+    raise ValueError(f"Unknown partition strategy: {strategy}")
+
+
 def partition_non_iid(
     x: np.ndarray,
     y: np.ndarray,
@@ -325,6 +423,7 @@ def load_cicids2017(
     binary: bool = True,
     balance_ratio: float = None,
     use_smote: bool = False,  # SMOTE oversamples minority class (train only)
+    return_attack_labels: bool = False,
     **_,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load CIC-IDS2017 CSV files and return (x_train, y_train, x_test, y_test).
@@ -425,9 +524,11 @@ def load_cicids2017(
     n_before = len(X)
     df_temp = pd.DataFrame(X)
     df_temp["_y"] = y
+    df_temp["_attack"] = y.astype(str)
     df_dedup = df_temp.drop_duplicates()
-    X = df_dedup.drop(columns=["_y"]).values.astype("float32")
+    X = df_dedup.drop(columns=["_y", "_attack"]).values.astype("float32")
     y = df_dedup["_y"].values
+    attack_labels = df_dedup["_attack"].values
     n_after = len(X)
     print(f"[load_cicids2017] Removed {n_before - n_after:,} duplicates ({n_after:,} unique)")
     
@@ -435,6 +536,7 @@ def load_cicids2017(
     unique_labels = np.unique(y)
     print(f"[load_cicids2017] Found {len(unique_labels)} unique labels")
     
+    attack_labels_raw = attack_labels.copy()
     if binary:
         # Convert to binary: BENIGN=0, everything else=1
         y_binary = np.where(y == 'BENIGN', 0, 1)
@@ -454,6 +556,7 @@ def load_cicids2017(
     shuffle_idx = rng.permutation(len(X))
     X = X[shuffle_idx]
     y = y[shuffle_idx]
+    attack_labels = attack_labels[shuffle_idx]
     print(f"[load_cicids2017] Shuffled full pool (random_state={random_state})")
 
     # Final sampling if needed (preserve ratio when capping by max_samples)
@@ -473,13 +576,14 @@ def load_cicids2017(
             rng.shuffle(keep_idx)
             X = X[keep_idx]
             y = y[keep_idx]
+            attack_labels = attack_labels[keep_idx]
             print(f"[load_cicids2017] Sampled down to {len(X):,} total samples (target ratio majority:minority={balance_ratio}:1)")
         else:
             unique, counts = np.unique(y, return_counts=True)
             min_class_count = counts.min()
             use_stratify = min_class_count >= 2
-            X, _, y, _ = train_test_split(
-                X, y,
+            X, _, y, _, attack_labels, _ = train_test_split(
+                X, y, attack_labels,
                 train_size=max_samples,
                 stratify=y if use_stratify else None,
                 random_state=random_state,
@@ -491,8 +595,8 @@ def load_cicids2017(
     min_class_count = counts.min()
     use_stratify = min_class_count >= 2
     
-    x_train, x_test, y_train, y_test = train_test_split(
-        X, y,
+    x_train, x_test, y_train, y_test, attack_train, attack_test = train_test_split(
+        X, y, attack_labels,
         test_size=test_size,
         stratify=y if use_stratify else None,
         random_state=random_state,
@@ -515,6 +619,7 @@ def load_cicids2017(
             rng.shuffle(balanced_idx)
             x_train = x_train[balanced_idx]
             y_train = y_train[balanced_idx]
+            attack_train = attack_train[balanced_idx]
             print(f"[load_cicids2017] Balanced training set: majority {n_majority} -> {n_majority_target} (ratio<={balance_ratio}), total={len(y_train):,}")
 
     # Feature scaling: improves NN training stability and accuracy (fit on train, transform on test)
@@ -531,7 +636,13 @@ def load_cicids2017(
             counts_before = np.bincount(y_train.astype(int))
             k = max(1, min(5, int(counts_before.min()) - 1))
             smote = SMOTE(random_state=random_state, k_neighbors=k)
+            n_before_smote = len(y_train)
             x_train, y_train = smote.fit_resample(x_train, y_train)
+            n_synth = len(y_train) - n_before_smote
+            if n_synth > 0:
+                attack_train = np.concatenate(
+                    [attack_train, np.array(["SMOTE"] * n_synth, dtype=object)]
+                )
             x_train = x_train.astype("float32")
             print(f"[load_cicids2017] SMOTE applied: train -> {len(y_train):,} (BENIGN={np.sum(y_train==0):,}, ATTACK={np.sum(y_train==1):,})")
         except Exception as e:
@@ -540,6 +651,8 @@ def load_cicids2017(
     print(f"[load_cicids2017] Final feature shape: {x_train.shape[1]} features")
     print(f"[load_cicids2017] Train samples: {len(x_train):,}, Test samples: {len(x_test):,}")
 
+    if return_attack_labels:
+        return x_train, y_train, x_test, y_test, attack_train, attack_test
     return x_train, y_train, x_test, y_test
 
 
@@ -695,6 +808,121 @@ def load_ton_iot(
 
 
 # -------------------------
+# UNSW-NB15
+# -------------------------
+
+def load_unsw_nb15(
+    data_path: str = "data/raw/UNSW-NB15",
+    max_samples: int = None,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    binary: bool = True,
+    balance_ratio: float = None,
+    use_smote: bool = False,
+    **_,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load UNSW-NB15 CSV files (train/test split files or combined CSV)."""
+    root = Path(data_path)
+    if not root.exists():
+        raise FileNotFoundError(
+            f"UNSW-NB15 path not found: {root.resolve()}. "
+            "Place UNSW_NB15_training-set.csv and testing-set.csv under data/raw/UNSW-NB15/"
+        )
+
+    train_files = sorted(root.glob("*training*.csv")) + sorted(root.glob("*train*.csv"))
+    test_files = sorted(root.glob("*testing*.csv")) + sorted(root.glob("*test*.csv"))
+    csv_files = train_files + test_files
+    if not csv_files:
+        csv_files = sorted(root.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(f"No UNSW-NB15 CSV files in {root}")
+
+    dfs = [pd.read_csv(p, low_memory=False) for p in csv_files]
+    df = pd.concat(dfs, axis=0, ignore_index=True)
+    df.columns = df.columns.str.strip()
+
+    label_col = None
+    for cand in ["label", "Label", "attack_cat", "Attack"]:
+        if cand in df.columns:
+            label_col = cand
+            break
+    if label_col is None:
+        raise KeyError(f"Label column not found in UNSW-NB15. Columns: {list(df.columns)[:15]}")
+
+    y_raw = df[label_col]
+    feature_df = df.drop(columns=[label_col])
+    for drop_col in ["id", "attack_cat", "Attack"]:
+        if drop_col in feature_df.columns and drop_col != label_col:
+            feature_df = feature_df.drop(columns=[drop_col])
+
+    if binary:
+        if pd.api.types.is_numeric_dtype(y_raw):
+            y = y_raw.values.astype(np.int64)
+            if len(np.unique(y)) > 2:
+                y = np.where(y == 0, 0, 1).astype(np.int64)
+        else:
+            y = np.where(y_raw.astype(str).str.lower().isin(["normal", "0", "benign"]), 0, 1).astype(np.int64)
+    else:
+        from sklearn.preprocessing import LabelEncoder
+        le = LabelEncoder()
+        y = le.fit_transform(y_raw.astype(str))
+
+    for col in list(feature_df.columns):
+        if feature_df[col].dtype == "object" or not np.issubdtype(feature_df[col].dtype, np.number):
+            try:
+                feature_df[col] = pd.to_numeric(feature_df[col], errors="coerce")
+            except Exception:
+                feature_df = feature_df.drop(columns=[col])
+    numeric_df = feature_df.select_dtypes(include=[np.number]).fillna(0)
+    X = numeric_df.values.astype("float32")
+
+    if max_samples is not None and len(X) > max_samples:
+        X, _, y, _ = train_test_split(
+            X, y, train_size=max_samples, stratify=y if np.min(np.bincount(y)) >= 2 else None,
+            random_state=random_state,
+        )
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size,
+        stratify=y if np.min(np.bincount(y)) >= 2 else None,
+        random_state=random_state,
+    )
+
+    if binary and balance_ratio is not None and balance_ratio > 0:
+        rng = np.random.default_rng(random_state)
+        counts = np.bincount(y_train.astype(int))
+        if len(counts) == 2:
+            minority_class = np.argmin(counts)
+            majority_class = 1 - minority_class
+            n_minority, n_majority = counts[minority_class], counts[majority_class]
+            if n_majority > n_minority * balance_ratio:
+                n_majority_target = int(n_minority * balance_ratio)
+                majority_idx = np.where(y_train == majority_class)[0]
+                keep_idx = rng.choice(majority_idx, size=n_majority_target, replace=False)
+                minority_idx = np.where(y_train == minority_class)[0]
+                balanced_idx = np.concatenate([minority_idx, keep_idx])
+                rng.shuffle(balanced_idx)
+                x_train, y_train = x_train[balanced_idx], y_train[balanced_idx]
+
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    x_train = scaler.fit_transform(x_train).astype("float32")
+    x_test = scaler.transform(x_test).astype("float32")
+
+    if binary and use_smote and len(np.unique(y_train)) == 2:
+        try:
+            from imblearn.over_sampling import SMOTE
+            smote = SMOTE(random_state=random_state, k_neighbors=min(5, int(np.bincount(y_train.astype(int)).min()) - 1))
+            x_train, y_train = smote.fit_resample(x_train, y_train)
+            x_train = x_train.astype("float32")
+        except Exception as e:
+            print(f"[load_unsw_nb15] SMOTE skipped: {e}")
+
+    print(f"[load_unsw_nb15] Features: {x_train.shape[1]}, Train: {len(y_train):,}, Test: {len(y_test):,}")
+    return x_train, y_train, x_test, y_test
+
+
+# -------------------------
 # Public API
 # -------------------------
 
@@ -723,6 +951,11 @@ def load_dataset(name: str, **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarra
         return load_cicids2017(**kwargs)
     elif name.lower() in ["ton_iot", "toniot", "ton_iot"]:
         return load_ton_iot(**kwargs)
+    elif name.lower() in ["unsw_nb15", "unsw-nb15", "unsw"]:
+        env_path = os.environ.get("UNSW_NB15_DATA_PATH")
+        if env_path:
+            kwargs["data_path"] = env_path
+        return load_unsw_nb15(**kwargs)
     else:
         raise ValueError(f"Unsupported dataset: {name}")
 
